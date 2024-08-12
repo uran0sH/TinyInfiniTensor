@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <numeric>
 #include <queue>
+#include "operators/matmul.h"
+#include "operators/transpose.h"
 
 namespace infini
 {
@@ -106,6 +108,88 @@ namespace infini
         // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
         // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
         // =================================== 作业 ===================================
+        auto isInverse = [](Shape permute1, Shape permute2) -> bool {
+            if (permute1.size() != permute2.size()) {
+                return false;
+            }
+
+            for (size_t i = 0; i < permute1.size(); ++i) {
+                if (permute2[permute1[i]] != i) {
+                    return false;
+                }
+            }
+            return true; 
+        };
+
+        auto isLast2Swap = [](Shape permute) -> bool {
+            auto size = permute.size();
+            return permute[size - 1] == size - 2 && permute[size - 2] == size - 1;
+        };
+
+        topo_sort();
+        for (auto p = ops.begin();p < ops.end();p++) {
+            auto op = *p;
+            if (op->getOpType() == OpType::Transpose) {
+                auto successors = op->getSuccessors();
+                if (successors.size() > 1) {
+                    continue;
+                }
+                Operator succ = successors[0];
+                if(succ->getOpType() == OpType::Transpose) {
+                    Shape p1 = std::dynamic_pointer_cast<TransposeObj>(op)->getPermute();
+                    Shape p2 = std::dynamic_pointer_cast<TransposeObj>(succ)->getPermute();
+                    if (isInverse(p1, p2)) {
+                        Tensor input = op->getInputs()[0];
+                        input->removeTarget(op);
+                        Tensor output = succ->getOutput();
+                        for (auto n : output->getTargets()) {
+                            input->addTarget(n);
+                            n->removePredecessors(succ);
+                            if (auto source = input->getSource(); source) {
+                                n->addPredecessors(source);
+                                source->removeSuccessors(op);
+                                source->addSuccessors(n);
+                            }
+                            n->replaceInput(output, input);
+                        }
+                        removeTensor(op->getOutput());
+                        removeTensor(output);
+                        removeOperator(succ);
+                        removeOperator(op);
+                    }
+                }
+            }
+            if (op->getOpType() == OpType::MatMul) {
+                Operator pred = op->getPredecessors()[0];
+                if (pred->getOpType() == OpType::Transpose && isLast2Swap(std::dynamic_pointer_cast<TransposeObj>(pred)->getPermute())) {
+                    Shape p = std::dynamic_pointer_cast<TransposeObj>(pred)->getPermute();
+                    Tensor output = pred->getOutput();
+                    auto matmul = std::dynamic_pointer_cast<MatmulObj>(op);
+                    if (matmul->getInputs()[0] == output && !matmul->getTransA()) {
+                        std::swap(p[p.size()-1], p[p.size()-2]);
+                        matmul->setTransA(true);
+                    }
+                    if (matmul->getInputs()[1] == output && !matmul->getTransB()) {
+                        std::swap(p[p.size()-1], p[p.size()-2]);
+                        matmul->setTransB(true);
+                    }
+                    int j = matmul->getInputs()[0] == output ? 0 : 1;
+                    Tensor input = pred->getInputs()[0];
+                    auto source = input->getSource();
+                    if (source) {
+                        source->removeSuccessors(pred);
+                        source->addSuccessors(matmul);
+                        op->addPredecessors(source);
+                    }
+                    input->removeTarget(pred);
+                    input->addTarget(op);
+                    op->removePredecessors(pred);
+                    op->inputs[j] = input;
+                    removeOperator(pred);
+                    removeTensor(output);
+                }
+            }
+        }
     }
 
     Tensor GraphObj::getTensor(int fuid) const
@@ -152,6 +236,18 @@ namespace infini
         // TODO：利用 allocator 给计算图分配内存
         // HINT: 获取分配好的内存指针后，可以调用 tensor 的 setDataBlob 函数给 tensor 绑定内存
         // =================================== 作业 ===================================
+        size_t size{0};
+        for (auto tensor: tensors) {
+            size += tensor->getBytes();
+        }
+
+        allocator.alloc(size);
+        size_t offset{0};
+        for (auto tensor: tensors) {
+            tensor->setDataBlob(make_ref<BlobObj>(runtime,
+                reinterpret_cast<void*>(reinterpret_cast<char*>(allocator.getPtr()) + offset)));
+            offset += tensor->getBytes();
+        }
 
         allocator.info();
     }
